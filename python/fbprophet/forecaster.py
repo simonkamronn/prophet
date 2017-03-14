@@ -48,7 +48,9 @@ class Prophet(object):
             mcmc_samples=0,
             interval_width=0.80,
             uncertainty_samples=1000,
+            exo_vars=list()
     ):
+        self.exo_vars = exo_vars
         self.growth = growth
 
         self.changepoints = pd.to_datetime(changepoints)
@@ -105,13 +107,53 @@ class Prophet(object):
     def get_linear_model(cls):
         # fb-block 3
         # fb-block 4 start
-        model_file = pkg_resources.resource_filename(
-            'fbprophet',
-            'stan_models/linear_growth.pkl'
-        )
+        model= """
+                data {
+                  int T;                                // Sample size
+                  int<lower=1> K;                       // Number of seasonal vectors
+                  int<lower=1> D;                       // Number of exogenous variables
+                  matrix[T, D] E;                       // Exogenous variables
+                  vector[T] y;                          // Time-series
+                  int S;                                // Number of changepoints
+                  matrix[T, S] A;                       // Split indicators
+                  real t_change[S];                     // Index of changepoints
+                  matrix[T,K] X;                        // season vectors
+                  real<lower=0> sigma;                  // scale on seasonality prior
+                  real<lower=0> tau;                    // scale on changepoints prior
+                }
+
+                parameters {
+                  real k;                               // Base growth rate
+                  real m;                               // offset
+                  vector[S] delta;                      // Rate adjustments
+                  real<lower=0> sigma_obs;              // Observation noise (incl. seasonal variation)
+                  vector[K] beta;                       // seasonal vector
+                  vector[D] w;                          // Exogenous coefficients
+                }
+
+                transformed parameters {
+                  vector[S] gamma;                      // adjusted offsets, for piecewise continuity
+
+                  for (i in 1:S) {
+                    gamma[i] = -t_change[i] * delta[i];
+                  }
+                }
+
+                model {
+                  //priors
+                  k ~ normal(0, 5);
+                  m ~ normal(0, 5);
+                  delta ~ double_exponential(0, tau);
+                  sigma_obs ~ normal(0, 0.5);
+                  beta ~ normal(0, sigma);
+                  w ~ student_t(3, 0, 1);
+
+                  // Likelihood
+                  y ~ normal(m + E * w + A * gamma + X * beta, sigma_obs);
+                }
+                """
         # fb-block 4 end
-        with open(model_file, 'rb') as f:
-            return pickle.load(f)
+        return pystan.StanModel(model_code=model)
 
     @classmethod
     def get_logistic_model(cls):
@@ -353,7 +395,8 @@ class Prophet(object):
             'K': seasonal_features.shape[1],
             'S': len(self.changepoints_t),
             'y': history['y_scaled'],
-            't': history['t'],
+            'D': len(self.exo_vars),
+            'E': history[self.exo_vars].as_matrix(),
             'A': A,
             't_change': self.changepoints_t,
             'X': seasonal_features,
@@ -376,6 +419,7 @@ class Prophet(object):
                 'delta': np.zeros(len(self.changepoints_t)),
                 'beta': np.zeros(seasonal_features.shape[1]),
                 'sigma_obs': 1,
+                'w': np.zeros(dat['D']),
             }
 
         if self.mcmc_samples > 0:
@@ -396,8 +440,8 @@ class Prophet(object):
         # If no changepoints were requested, replace delta with 0s
         if len(self.changepoints) == 0:
             # Fold delta into the base rate k
-            params['k'] = params['k'] + params['delta']
-            params['delta'] = np.zeros(params['delta'].shape)
+            self.params['k'] = self.params['k'] + self.params['delta']
+            self.params['delta'] = np.zeros(self.params['delta'].shape)
 
         return self
 
@@ -415,7 +459,7 @@ class Prophet(object):
         else:
             df = self.setup_dataframe(df)
 
-        df['trend'] = self.predict_trend(df)
+        df['trend'] = self.forecast(df)
         seasonal_components = self.predict_seasonal_components(df)
         intervals = self.predict_uncertainty(df)
 
@@ -469,6 +513,12 @@ class Prophet(object):
                 t, cap, deltas, k, m, self.changepoints_t)
 
         return trend * self.y_scale
+
+    def forecast(self, df):
+        m = np.nanmean(self.params['m'])
+        w = np.nanmean(self.params['w'], axis=0)
+
+        return ((m + np.matmul(df[self.exo_vars].as_matrix(), w.T)) * self.y_scale).ravel()
 
     def predict_seasonal_components(self, df):
         seasonal_features = self.make_all_seasonality_features(df)
@@ -537,7 +587,9 @@ class Prophet(object):
         return pd.DataFrame(series)
 
     def sample_model(self, df, seasonal_features, iteration):
-        trend = self.sample_predictive_trend(df, iteration)
+        # trend = self.sample_predictive_trend(df, iteration)
+
+        trend = self.forecast(df) * self.y_scale
 
         beta = self.params['beta'][iteration]
         seasonal = np.matmul(seasonal_features.as_matrix(), beta) * self.y_scale
